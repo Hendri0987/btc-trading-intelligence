@@ -1,47 +1,28 @@
 
-const API = "https://fapi.binance.com";
+const BASE = "https://www.okx.com";
+const INST = "BTC-USDT-SWAP";
 
-async function getData(path) {
+async function request(path) {
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), 8000);
 
   try {
-    const response = await fetch(API + path, {
+    const response = await fetch(BASE + path, {
       signal: controller.signal,
       headers: { Accept: "application/json" }
     });
 
-    const body = await response.text();
+    const json = await response.json();
 
-    if (!response.ok) {
-      return {
-        ok: false,
-        httpStatus: response.status,
-        error: body.slice(0, 300)
-      };
+    if (!response.ok || json.code !== "0") {
+      throw Error(
+        `HTTP ${response.status}: ${json.msg || json.code}`
+      );
     }
 
-    try {
-      return {
-        ok: true,
-        httpStatus: response.status,
-        data: JSON.parse(body)
-      };
-    } catch {
-      return {
-        ok: false,
-        httpStatus: response.status,
-        error: "Invalid JSON response"
-      };
-    }
+    return { ok: true, data: json.data };
   } catch (error) {
-    return {
-      ok: false,
-      httpStatus: null,
-      error: error.name === "AbortError"
-        ? "Request timeout"
-        : error.message
-    };
+    return { ok: false, error: error.message };
   } finally {
     clearTimeout(timeout);
   }
@@ -50,121 +31,146 @@ async function getData(path) {
 exports.handler = async () => {
   const headers = {
     "Content-Type": "application/json",
-    "Cache-Control": "no-store"
+    "Cache-Control": "public, max-age=30"
   };
 
-  const endpoints = {
-    oi: "/fapi/v1/openInterest?symbol=BTCUSDT",
-    premium: "/fapi/v1/premiumIndex?symbol=BTCUSDT",
-    ratio: "/futures/data/globalLongShortAccountRatio?symbol=BTCUSDT&period=5m&limit=1",
-    klines: "/fapi/v1/klines?symbol=BTCUSDT&interval=5m&limit=3",
-    depth: "/fapi/v1/depth?symbol=BTCUSDT&limit=100"
+  const paths = {
+    oi: `/api/v5/public/open-interest?instType=SWAP&instId=${INST}`,
+    premium: `/api/v5/public/funding-rate?instId=${INST}`,
+    depth: `/api/v5/market/books?instId=${INST}&sz=100`,
+    trades: `/api/v5/market/trades?instId=${INST}&limit=100`
   };
 
   const entries = await Promise.all(
-    Object.entries(endpoints).map(async ([name, path]) => {
-      return [name, await getData(path)];
-    })
+    Object.entries(paths).map(async ([key, path]) =>
+      [key, await request(path)]
+    )
   );
 
   const results = Object.fromEntries(entries);
-  const diagnostics = {};
-  const unavailable = [];
+  const unavailable = entries
+    .filter(([, result]) => !result.ok)
+    .map(([key]) => key);
+
+  const diagnostics = Object.fromEntries(
+    entries.map(([key, result]) => [
+      key,
+      result.ok
+        ? { ok: true }
+        : { ok: false, error: result.error }
+    ])
+  );
+
   const data = {};
 
-  for (const [name, result] of entries) {
-    diagnostics[name] = {
-      ok: result.ok,
-      httpStatus: result.httpStatus,
-      ...(result.ok ? {} : { error: result.error })
-    };
-
-    if (!result.ok) unavailable.push(name);
-  }
-
   if (results.oi.ok) {
-    const n = Number(results.oi.data.openInterest);
-    if (Number.isFinite(n)) data.openInterestBTC = n;
-  }
+    const row = results.oi.data[0];
+    const value = Number(row?.oiCcy);
 
-  if (results.premium.ok) {
-    const premium = results.premium.data;
-    const funding = Number(premium.lastFundingRate);
-    const next = Number(premium.nextFundingTime);
-
-    if (Number.isFinite(funding)) data.fundingRate = funding;
-    if (next > 0) data.nextFundingTime = next;
-  }
-
-  if (results.ratio.ok) {
-    const ratio = results.ratio.data;
-    if (Array.isArray(ratio) && ratio[0]) {
-      const n = Number(ratio[0].longShortRatio);
-      if (Number.isFinite(n)) data.longShortRatio = n;
+    if (Number.isFinite(value)) {
+      data.openInterestBTC = value;
     }
   }
 
-  if (results.klines.ok) {
-    const klines = results.klines.data;
+  if (results.premium.ok) {
+    const row = results.premium.data[0];
+    const rate = Number(row?.fundingRate);
+    const next = Number(row?.fundingTime);
 
-    if (Array.isArray(klines)) {
-      const now = Date.now();
-      const closed = klines.filter(
-        k => Number(k[6]) < now
-      ).at(-1);
+    if (Number.isFinite(rate)) {
+      data.fundingRate = rate;
+    }
 
-      if (closed) {
-        const total = Number(closed[5]);
-        const buy = Number(closed[9]);
-
-        if (total > 0 && Number.isFinite(buy)) {
-          data.takerBuyShare = buy / total;
-          data.takerBuyVolumeBTC = buy;
-          data.takerSellVolumeBTC = total - buy;
-        }
-      }
+    if (Number.isFinite(next) && next > 0) {
+      data.nextFundingTime = next;
     }
   }
 
   if (results.depth.ok) {
-    const depth = results.depth.data;
+    const book = results.depth.data[0];
 
-    if (Array.isArray(depth.bids) && Array.isArray(depth.asks)) {
-      const bestBid = Number(depth.bids[0]?.[0]);
-      const bestAsk = Number(depth.asks[0]?.[0]);
-      const mid = (bestBid + bestAsk) / 2;
+    const bids = book?.bids || [];
+    const asks = book?.asks || [];
 
-      if (Number.isFinite(mid) && mid > 0) {
-        const bid = depth.bids.reduce((sum, [p, q]) => {
-          p = Number(p);
-          q = Number(q);
-          return p >= mid * 0.995 ? sum + p * q : sum;
-        }, 0);
+    // OKX swap quantities are contracts.
+    // Convert using contract value in BTC.
+    const contract = await request(
+      `/api/v5/public/instruments?instType=SWAP&instId=${INST}`
+    );
 
-        const ask = depth.asks.reduce((sum, [p, q]) => {
-          p = Number(p);
-          q = Number(q);
-          return p <= mid * 1.005 ? sum + p * q : sum;
-        }, 0);
+    const ctVal = contract.ok
+      ? Number(contract.data[0]?.ctVal)
+      : NaN;
 
-        data.bidDepthUSDT = bid;
-        data.askDepthUSDT = ask;
+    const ctValCcy = contract.ok
+      ? contract.data[0]?.ctValCcy
+      : null;
 
-        if (bid + ask > 0) {
-          data.depthImbalance = (bid - ask) / (bid + ask);
-        }
+    if (ctVal > 0 && ctValCcy === "BTC" &&
+        bids.length && asks.length) {
+      const mid =
+        (Number(bids[0][0]) + Number(asks[0][0])) / 2;
+
+      const bid = bids.reduce((sum, [price, qty]) => {
+        const p = Number(price);
+        return p >= mid * 0.995
+          ? sum + p * Number(qty) * ctVal
+          : sum;
+      }, 0);
+
+      const ask = asks.reduce((sum, [price, qty]) => {
+        const p = Number(price);
+        return p <= mid * 1.005
+          ? sum + p * Number(qty) * ctVal
+          : sum;
+      }, 0);
+
+      data.bidDepthUSDT = bid;
+      data.askDepthUSDT = ask;
+
+      if (bid + ask > 0) {
+        data.depthImbalance =
+          (bid - ask) / (bid + ask);
       }
+    } else {
+      unavailable.push("depthConversion");
+      diagnostics.depthConversion = {
+        ok: false,
+        error: "Contract conversion unavailable"
+      };
     }
   }
 
-  const ok = unavailable.length < entries.length;
+  if (results.trades.ok) {
+    const trades = results.trades.data || [];
+    const buy = trades
+      .filter(t => t.side === "buy")
+      .reduce((s, t) => s + Number(t.sz), 0);
+
+    const sell = trades
+      .filter(t => t.side === "sell")
+      .reduce((s, t) => s + Number(t.sz), 0);
+
+    if (buy + sell > 0) {
+      data.takerBuyShare = buy / (buy + sell);
+    }
+
+    // Recent-trade sample, not a full 5m candle.
+    data.tradeSampleCount = trades.length;
+  }
+
+  // OKX does not provide an equivalent ratio
+  // through these selected public endpoints.
+  unavailable.push("ratio");
+
+  const ok = entries.some(([, result]) => result.ok);
 
   return {
     statusCode: ok ? 200 : 502,
     headers,
     body: JSON.stringify({
       ok,
-      source: "Binance USD-M Futures public API",
+      source: "OKX BTC-USDT-SWAP Public API",
       fetchedAt: new Date().toISOString(),
       data,
       unavailable,
