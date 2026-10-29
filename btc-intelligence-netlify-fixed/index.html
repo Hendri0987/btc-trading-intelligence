@@ -114,4 +114,170 @@ async function refreshFutures(){
 }
 document.getElementById('futures-refresh').onclick=refreshFutures;
 refreshFutures();setInterval(refreshFutures,120000);
-</script></body></html>
+</script>
+<script>
+(function () {
+  'use strict';
+
+  const KEY = 'btc_whale_v2_history';
+  const $w = id => document.getElementById(id);
+  const number = (v, digits = 2) =>
+    Number.isFinite(v)
+      ? v.toLocaleString('en-US', {
+          minimumFractionDigits: digits,
+          maximumFractionDigits: digits
+        })
+      : '—';
+
+  let saved = {};
+  try {
+    saved = JSON.parse(localStorage.getItem(KEY) || '{}');
+  } catch (_) {}
+
+  let oiHistory = Array.isArray(saved.oi) ? saved.oi : [];
+  let seen = Array.isArray(saved.seen) ? saved.seen : [];
+  let cvd = Number.isFinite(saved.cvd) ? saved.cvd : 0;
+  let counted = Number.isFinite(saved.counted) ? saved.counted : 0;
+
+  const radar = $w('futures-radar');
+  if (!radar || $w('whale-v2')) return;
+
+  const section = document.createElement('div');
+  section.id = 'whale-v2';
+  section.style.marginTop = '20px';
+
+  section.innerHTML = `
+    <h2>Whale Radar V2 · OI Change & Sampled CVD</h2>
+    <div class="metrics">
+      <div class="metric">
+        <small>OI Change 5m</small>
+        <b id="wv-5">Menunggu...</b>
+      </div>
+      <div class="metric">
+        <small>OI Change 15m</small>
+        <b id="wv-15">Menunggu...</b>
+      </div>
+      <div class="metric">
+        <small>OI Change 1H</small>
+        <b id="wv-60">Menunggu...</b>
+      </div>
+      <div class="metric">
+        <small>Sampled CVD</small>
+        <b id="wv-cvd">Menunggu...</b>
+      </div>
+      <div class="metric">
+        <small>Transaksi unik teramati</small>
+        <b id="wv-count">0</b>
+      </div>
+      <div class="metric">
+        <small>Status radar</small>
+        <b id="wv-status">Menghubungkan...</b>
+      </div>
+    </div>
+    <p class="muted" id="wv-note">
+      OI Change memerlukan riwayat pengamatan.
+      Sampled CVD tidak mencakup seluruh transaksi pasar.
+    </p>
+  `;
+
+  radar.appendChild(section);
+
+  function save() {
+    try {
+      localStorage.setItem(KEY, JSON.stringify({
+        oi: oiHistory,
+        seen,
+        cvd,
+        counted
+      }));
+    } catch (_) {}
+  }
+
+  function change(minutes, now) {
+    const target = now - minutes * 60000;
+
+    const older = oiHistory
+      .filter(x => x.t <= target)
+      .at(-1);
+
+    const latest = oiHistory.at(-1);
+
+    if (!older || !latest || !older.v) return 'Menunggu...';
+
+    const pct = (latest.v - older.v) / older.v * 100;
+    return (pct >= 0 ? '+' : '') + number(pct, 3) + '%';
+  }
+
+  async function updateWhale() {
+    try {
+      const response = await fetch(
+        '/.netlify/functions/futures',
+        { cache: 'no-store' }
+      );
+
+      const body = await response.json();
+      if (!response.ok || !body.ok) {
+        throw Error('Data OKX tidak tersedia');
+      }
+
+      const d = body.data || {};
+      const now = Date.now();
+
+      if (Number.isFinite(d.openInterestBTC)) {
+        oiHistory.push({ t: now, v: d.openInterestBTC });
+        oiHistory = oiHistory
+          .filter(x => x.t >= now - 26 * 3600000)
+          .slice(-1000);
+      }
+
+      if (Array.isArray(d.recentTrades)) {
+        const known = new Set(seen);
+
+        const trades = d.recentTrades
+          .filter(t =>
+            t.id &&
+            !known.has(String(t.id)) &&
+            Number.isFinite(t.btc) &&
+            t.btc > 0 &&
+            (t.side === 'buy' || t.side === 'sell')
+          )
+          .sort((a, b) => a.ts - b.ts);
+
+        for (const trade of trades) {
+          known.add(String(trade.id));
+          cvd += trade.side === 'buy'
+            ? trade.btc
+            : -trade.btc;
+          counted++;
+        }
+
+        seen = Array.from(known).slice(-10000);
+      }
+
+      $w('wv-5').textContent = change(5, now);
+      $w('wv-15').textContent = change(15, now);
+      $w('wv-60').textContent = change(60, now);
+      $w('wv-cvd').textContent = number(cvd, 4) + ' BTC';
+      $w('wv-count').textContent = number(counted, 0);
+      $w('wv-status').textContent = 'OKX Connected';
+
+      $w('wv-note').textContent =
+        'Sampled CVD = akumulasi volume buy minus sell ' +
+        'dari transaksi unik yang tertangkap sejak radar dimulai. ' +
+        'Data tidak lengkap ketika dashboard tidak aktif. ' +
+        'OI Change menggunakan snapshot historis browser.';
+
+      save();
+    } catch (error) {
+      $w('wv-status').textContent = 'Data unavailable';
+      $w('wv-note').textContent =
+        'Koneksi radar gagal: ' + error.message +
+        '. Data historis terakhir disimpan.';
+    }
+  }
+
+  updateWhale();
+  setInterval(updateWhale, 120000);
+})();
+</script>
+</body></html>
