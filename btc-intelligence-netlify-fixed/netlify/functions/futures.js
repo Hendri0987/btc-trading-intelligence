@@ -1,176 +1,160 @@
 
-const BASE = "https://www.okx.com";
-const INST = "BTC-USDT-SWAP";
+const BASE = 'https://www.okx.com';
+const INST = 'BTC-USDT-SWAP';
 
-async function request(path) {
-  const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), 8000);
+async function get(path) {
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), 8000);
 
   try {
-    const response = await fetch(BASE + path, {
-      signal: controller.signal,
-      headers: { Accept: "application/json" }
+    const r = await fetch(BASE + path, {
+      signal: ctrl.signal,
+      headers: { Accept: 'application/json' }
     });
 
-    const json = await response.json();
+    const j = await r.json();
 
-    if (!response.ok || json.code !== "0") {
-      throw Error(
-        `HTTP ${response.status}: ${json.msg || json.code}`
-      );
+    if (!r.ok || j.code !== '0') {
+      throw Error(`HTTP ${r.status}: ${j.msg || j.code}`);
     }
 
-    return { ok: true, data: json.data };
-  } catch (error) {
-    return { ok: false, error: error.message };
+    return { ok: true, data: j.data };
+  } catch (e) {
+    return {
+      ok: false,
+      error: e.name === 'AbortError' ? 'Timeout' : e.message
+    };
   } finally {
-    clearTimeout(timeout);
+    clearTimeout(timer);
   }
 }
 
 exports.handler = async () => {
-  const headers = {
-    "Content-Type": "application/json",
-    "Cache-Control": "public, max-age=30"
-  };
-
   const paths = {
     oi: `/api/v5/public/open-interest?instType=SWAP&instId=${INST}`,
     premium: `/api/v5/public/funding-rate?instId=${INST}`,
     depth: `/api/v5/market/books?instId=${INST}&sz=100`,
-    trades: `/api/v5/market/trades?instId=${INST}&limit=100`
+    trades: `/api/v5/market/trades?instId=${INST}&limit=100`,
+    contract: `/api/v5/public/instruments?instType=SWAP&instId=${INST}`
   };
 
   const entries = await Promise.all(
-    Object.entries(paths).map(async ([key, path]) =>
-      [key, await request(path)]
-    )
+    Object.entries(paths).map(async ([k, p]) => [k, await get(p)])
   );
 
-  const results = Object.fromEntries(entries);
+  const res = Object.fromEntries(entries);
+
   const unavailable = entries
-    .filter(([, result]) => !result.ok)
-    .map(([key]) => key);
+    .filter(([, v]) => !v.ok)
+    .map(([k]) => k);
 
   const diagnostics = Object.fromEntries(
-    entries.map(([key, result]) => [
-      key,
-      result.ok
-        ? { ok: true }
-        : { ok: false, error: result.error }
+    entries.map(([k, v]) => [
+      k,
+      v.ok ? { ok: true } : { ok: false, error: v.error }
     ])
   );
 
   const data = {};
 
-  if (results.oi.ok) {
-    const row = results.oi.data[0];
-    const value = Number(row?.oiCcy);
-
-    if (Number.isFinite(value)) {
-      data.openInterestBTC = value;
-    }
+  if (res.oi.ok) {
+    const v = Number(res.oi.data[0]?.oiCcy);
+    if (Number.isFinite(v)) data.openInterestBTC = v;
   }
 
-  if (results.premium.ok) {
-    const row = results.premium.data[0];
-    const rate = Number(row?.fundingRate);
-    const next = Number(row?.fundingTime);
+  if (res.premium.ok) {
+    const v = res.premium.data[0];
+    const rate = Number(v?.fundingRate);
+    const next = Number(v?.fundingTime);
 
-    if (Number.isFinite(rate)) {
-      data.fundingRate = rate;
-    }
-
-    if (Number.isFinite(next) && next > 0) {
-      data.nextFundingTime = next;
-    }
+    if (Number.isFinite(rate)) data.fundingRate = rate;
+    if (next > 0) data.nextFundingTime = next;
   }
 
-  if (results.depth.ok) {
-    const book = results.depth.data[0];
+  const c = res.contract.ok ? res.contract.data[0] : null;
+  const ctVal = Number(c?.ctVal);
+  const validContract =
+    ctVal > 0 && c?.ctValCcy === 'BTC';
 
-    const bids = book?.bids || [];
-    const asks = book?.asks || [];
+  if (res.depth.ok && validContract) {
+    const b = res.depth.data[0]?.bids || [];
+    const a = res.depth.data[0]?.asks || [];
 
-    // OKX swap quantities are contracts.
-    // Convert using contract value in BTC.
-    const contract = await request(
-      `/api/v5/public/instruments?instType=SWAP&instId=${INST}`
-    );
-
-    const ctVal = contract.ok
-      ? Number(contract.data[0]?.ctVal)
-      : NaN;
-
-    const ctValCcy = contract.ok
-      ? contract.data[0]?.ctValCcy
-      : null;
-
-    if (ctVal > 0 && ctValCcy === "BTC" &&
-        bids.length && asks.length) {
+    if (b.length && a.length) {
       const mid =
-        (Number(bids[0][0]) + Number(asks[0][0])) / 2;
+        (Number(b[0][0]) + Number(a[0][0])) / 2;
 
-      const bid = bids.reduce((sum, [price, qty]) => {
-        const p = Number(price);
-        return p >= mid * 0.995
-          ? sum + p * Number(qty) * ctVal
-          : sum;
-      }, 0);
+      const bid = b.reduce(
+        (s, [p, q]) =>
+          Number(p) >= mid * 0.995
+            ? s + Number(p) * Number(q) * ctVal
+            : s,
+        0
+      );
 
-      const ask = asks.reduce((sum, [price, qty]) => {
-        const p = Number(price);
-        return p <= mid * 1.005
-          ? sum + p * Number(qty) * ctVal
-          : sum;
-      }, 0);
+      const ask = a.reduce(
+        (s, [p, q]) =>
+          Number(p) <= mid * 1.005
+            ? s + Number(p) * Number(q) * ctVal
+            : s,
+        0
+      );
 
       data.bidDepthUSDT = bid;
       data.askDepthUSDT = ask;
 
       if (bid + ask > 0) {
-        data.depthImbalance =
-          (bid - ask) / (bid + ask);
+        data.depthImbalance = (bid - ask) / (bid + ask);
       }
-    } else {
-      unavailable.push("depthConversion");
-      diagnostics.depthConversion = {
-        ok: false,
-        error: "Contract conversion unavailable"
-      };
     }
+  } else if (res.depth.ok) {
+    unavailable.push('depthConversion');
   }
 
-  if (results.trades.ok) {
-    const trades = results.trades.data || [];
-    const buy = trades
-      .filter(t => t.side === "buy")
+  if (res.trades.ok) {
+    const rows = res.trades.data || [];
+
+    const buy = rows
+      .filter(t => t.side === 'buy')
       .reduce((s, t) => s + Number(t.sz), 0);
 
-    const sell = trades
-      .filter(t => t.side === "sell")
+    const sell = rows
+      .filter(t => t.side === 'sell')
       .reduce((s, t) => s + Number(t.sz), 0);
 
     if (buy + sell > 0) {
       data.takerBuyShare = buy / (buy + sell);
     }
 
-    // Recent-trade sample, not a full 5m candle.
-    data.tradeSampleCount = trades.length;
+    data.tradeSampleCount = rows.length;
+
+    if (validContract) {
+      data.recentTrades = rows
+        .filter(t => t.tradeId && Number(t.sz) > 0)
+        .map(t => ({
+          id: String(t.tradeId),
+          side: t.side,
+          btc: Number(t.sz) * ctVal,
+          ts: Number(t.ts)
+        }));
+    } else {
+      unavailable.push('tradeConversion');
+    }
   }
 
-  // OKX does not provide an equivalent ratio
-  // through these selected public endpoints.
-  unavailable.push("ratio");
+  unavailable.push('ratio');
 
-  const ok = entries.some(([, result]) => result.ok);
+  const ok = entries.some(([, v]) => v.ok);
 
   return {
     statusCode: ok ? 200 : 502,
-    headers,
+    headers: {
+      'Content-Type': 'application/json',
+      'Cache-Control': 'no-store'
+    },
     body: JSON.stringify({
       ok,
-      source: "OKX BTC-USDT-SWAP Public API",
+      source: 'OKX BTC-USDT-SWAP Public API',
       fetchedAt: new Date().toISOString(),
       data,
       unavailable,
